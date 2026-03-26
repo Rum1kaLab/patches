@@ -1,0 +1,46 @@
+commit 8d70bafdcadf4c22ab40c42ae011a3aa7690050e
+Author: prpjzz <groovemusic4399@pm.me>
+Date:   Thu Mar 26 04:16:00 2026 +0000
+
+    revert fix: fs/proc/task_mmu.c: fix incorrect use of vma->vm_file
+
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 9fc713eeec42..8b081ce79a61 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -369,9 +369,34 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
+ 	unsigned long start, end;
+ 	dev_t dev = 0;
+ 	const char *name = NULL;
+-
++#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
++	char *spoofed_redirected_name = NULL;
++#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+ 	if (file) {
+ 		struct inode *inode = file_inode(vma->vm_file);
++#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
++		if (SUSFS_IS_INODE_OPEN_REDIRECT(inode)) {
++			if (!susfs_open_redirect_spoof_show_map_vma(inode, &ino, &dev, spoofed_redirected_name)) {
++				pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
++				goto orig_flow;
++			}
++		}
++#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++		if (SUSFS_IS_INODE_SUS_MAP(inode)) {
++			seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
++			seq_printf(m, "%08lx-%08lx %c%c%c%c %08llx %02x:%02x %lu ",
++				start,
++				end,
++				'-',
++				'-',
++				'-',
++				'p',
++				pgoff,
++				MAJOR(dev), MINOR(dev), ino);
++			goto done;
++		}
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 		dev = inode->i_sb->s_dev;
+ 		ino = inode->i_ino;
+ 		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
