@@ -1,0 +1,7 @@
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -XXXX,X +XXXX,X @@
+
+-static struct security_operations selinux_ops = {
++struct security_operations selinux_ops = {
+   .name =        "selinux",
