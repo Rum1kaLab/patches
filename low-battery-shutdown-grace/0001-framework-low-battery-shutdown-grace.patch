@@ -1,0 +1,379 @@
+diff --git a/core/java/android/os/BatteryManager.java b/core/java/android/os/BatteryManager.java
+index e9e84629a..f9c9de53e 100644
+--- a/core/java/android/os/BatteryManager.java
++++ b/core/java/android/os/BatteryManager.java
+@@ -301,6 +301,35 @@ public class BatteryManager {
+      */
+     public static final String EXTRA_OEM_CHARGER = "oem_charger";
+ 
++    /**
++     * Internal SystemUI event for a pending low-battery shutdown.
++     * @hide
++     */
++    public static final String ACTION_LOW_BATTERY_SHUTDOWN_WARNING =
++            "android.os.action.LOW_BATTERY_SHUTDOWN_WARNING";
++
++    /** @hide */
++    public static final String EXTRA_LOW_BATTERY_SHUTDOWN_STATE =
++            "android.os.extra.LOW_BATTERY_SHUTDOWN_STATE";
++
++    /** @hide */
++    public static final String EXTRA_LOW_BATTERY_SHUTDOWN_DEADLINE =
++            "android.os.extra.LOW_BATTERY_SHUTDOWN_DEADLINE";
++
++    /** @hide */
++    public static final String EXTRA_LOW_BATTERY_SHUTDOWN_GENERATION =
++            "android.os.extra.LOW_BATTERY_SHUTDOWN_GENERATION";
++
++    /** @hide */
++    public static final String EXTRA_LOW_BATTERY_SHUTDOWN_EVENT_SEQUENCE =
++            "android.os.extra.LOW_BATTERY_SHUTDOWN_EVENT_SEQUENCE";
++
++    /** @hide */
++    public static final int LOW_BATTERY_SHUTDOWN_STATE_PENDING = 1;
++
++    /** @hide */
++    public static final int LOW_BATTERY_SHUTDOWN_STATE_CANCELED = 2;
++
+     // values for "status" field in the ACTION_BATTERY_CHANGED Intent
+     public static final int BATTERY_STATUS_UNKNOWN = Constants.BATTERY_STATUS_UNKNOWN;
+     public static final int BATTERY_STATUS_CHARGING = Constants.BATTERY_STATUS_CHARGING;
+diff --git a/core/res/res/values/config.xml b/core/res/res/values/config.xml
+index 0170832ff..7d378fb7f 100644
+--- a/core/res/res/values/config.xml
++++ b/core/res/res/values/config.xml
+@@ -1430,6 +1430,9 @@
+     <!-- Shutdown if the battery temperature exceeds (this value * 0.1) Celsius. -->
+     <integer name="config_shutdownBatteryTemperature">680</integer>
+ 
++    <!-- Delay low-battery shutdown by this many milliseconds. Zero preserves immediate shutdown. -->
++    <integer name="config_lowBatteryShutdownDelayMs">30000</integer>
++
+     <!-- Shutdown if battery is critically low and the device is not powered. -->
+     <bool name="config_shutdownIfNoPower">true</bool>
+ 
+diff --git a/core/res/res/values/symbols.xml b/core/res/res/values/symbols.xml
+index a2376c5d1..36b2665e2 100644
+--- a/core/res/res/values/symbols.xml
++++ b/core/res/res/values/symbols.xml
+@@ -2214,6 +2214,7 @@
+   <java-symbol type="integer" name="config_keyboardBacklightTimeoutMs" />
+   <java-symbol type="integer" name="config_carDockKeepsScreenOn" />
+   <java-symbol type="integer" name="config_criticalBatteryWarningLevel" />
++  <java-symbol type="integer" name="config_lowBatteryShutdownDelayMs" />
+   <java-symbol type="integer" name="config_datause_notification_type" />
+   <java-symbol type="integer" name="config_datause_polling_period_sec" />
+   <java-symbol type="integer" name="config_datause_threshold_bytes" />
+diff --git a/services/core/java/com/android/server/BatteryService.java b/services/core/java/com/android/server/BatteryService.java
+index 6e2599c90..5243b3d93 100644
+--- a/services/core/java/com/android/server/BatteryService.java
++++ b/services/core/java/com/android/server/BatteryService.java
+@@ -31,8 +31,10 @@ import android.annotation.RequiresPermission;
+ import android.annotation.SuppressLint;
+ import android.app.ActivityManager;
+ import android.app.ActivityManagerInternal;
++import android.app.AlarmManager;
+ import android.app.AppOpsManager;
+ import android.app.BroadcastOptions;
++import android.content.ActivityNotFoundException;
+ import android.content.ContentResolver;
+ import android.content.Context;
+ import android.content.Intent;
+@@ -157,11 +159,15 @@ public final class BatteryService extends SystemService {
+ 
+     // This should probably be exposed in the API, though it's not critical
+     private static final int BATTERY_PLUGGED_NONE = OsProtoEnums.BATTERY_PLUGGED_NONE; // = 0
++    private static final String LOW_BATTERY_SHUTDOWN_ALARM_TAG =
++            TAG + ".LowBatteryShutdown";
++    private static final long SHUTDOWN_ACTIVITY_RETRY_DELAY_MS = 1_000;
+ 
+     private final Context mContext;
+     private final IBatteryStats mBatteryStats;
+     BinderService mBinderService;
+     private final Handler mHandler;
++    private final AlarmManager mAlarmManager;
+ 
+     private final Object mLock = new Object();
+     private final ConditionVariable mConditionVariable = new ConditionVariable();
+@@ -305,6 +311,16 @@ public final class BatteryService extends SystemService {
+     private int mBatteryNearlyFullLevel;
+     private int mShutdownBatteryTemperature;
+     private boolean mShutdownIfNoPower;
++    private long mLowBatteryShutdownDelayMs;
++    private AlarmManager.OnAlarmListener mLowBatteryShutdownAlarm;
++    private long mLowBatteryShutdownGeneration;
++    private long mLowBatteryShutdownEventSequence;
++    private long mLowBatteryShutdownDeadlineElapsedRealtime;
++    private boolean mLowBatteryShutdownPending;
++    private boolean mLowBatteryShutdownCommitted;
++    private long mLowBatteryShutdownRequestId;
++    private long mThermalShutdownRequestId;
++    private boolean mThermalShutdownRequested;
+ 
+     private static String sSystemUiPackage;
+ 
+@@ -380,6 +396,11 @@ public final class BatteryService extends SystemService {
+             .setDeliveryGroupMatchingKey("android", Intent.ACTION_BATTERY_OKAY)
+             .setDeferralPolicy(BroadcastOptions.DEFERRAL_POLICY_UNTIL_ACTIVE)
+             .toBundle();
++    private static final Bundle LOW_BATTERY_SHUTDOWN_OPTIONS = BroadcastOptions.makeBasic()
++            .setDeliveryGroupPolicy(BroadcastOptions.DELIVERY_GROUP_POLICY_MOST_RECENT)
++            .setDeliveryGroupMatchingKey("android",
++                    BatteryManager.ACTION_LOW_BATTERY_SHUTDOWN_WARNING)
++            .toBundle();
+ 
+     private MetricsLogger mMetricsLogger;
+ 
+@@ -473,6 +494,7 @@ public final class BatteryService extends SystemService {
+ 
+         mContext = context;
+         mHandler = new Handler(looper, mLocalCallback, true /*async*/);
++        mAlarmManager = mContext.getSystemService(AlarmManager.class);
+         mLed = new Led(context, getLocalService(LightsManager.class));
+         mBatteryStats = BatteryStatsService.getService();
+         mActivityManagerInternal = LocalServices.getService(ActivityManagerInternal.class);
+@@ -493,6 +515,8 @@ public final class BatteryService extends SystemService {
+                 com.android.internal.R.integer.config_shutdownBatteryTemperature);
+         mShutdownIfNoPower = mContext.getResources().getBoolean(
+                 com.android.internal.R.bool.config_shutdownIfNoPower);
++        mLowBatteryShutdownDelayMs = mContext.getResources().getInteger(
++                com.android.internal.R.integer.config_lowBatteryShutdownDelayMs);
+         sSystemUiPackage = mContext.getResources().getString(
+                 com.android.internal.R.string.config_systemUi);
+ 
+@@ -666,47 +690,184 @@ public final class BatteryService extends SystemService {
+         return mHealthInfo.batteryStatus != BatteryManager.BATTERY_STATUS_CHARGING;
+     }
+ 
++    private Intent createShutdownIntent(String reason) {
++        Intent intent = new Intent(Intent.ACTION_REQUEST_SHUTDOWN);
++        intent.putExtra(Intent.EXTRA_KEY_CONFIRM, false);
++        intent.putExtra(Intent.EXTRA_REASON, reason);
++        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        return intent;
++    }
++
+     private void shutdownIfNoPowerLocked() {
+-        // shut down gracefully if our battery is critically low and we are not powered.
+-        // wait until the system has booted before attempting to display the shutdown dialog.
+-        if (shouldShutdownLocked()) {
+-            Intent intent = new Intent(Intent.ACTION_REQUEST_SHUTDOWN);
+-            intent.putExtra(Intent.EXTRA_KEY_CONFIRM, false);
+-            intent.putExtra(Intent.EXTRA_REASON,
+-                    PowerManager.SHUTDOWN_LOW_BATTERY);
+-            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-            mHandler.post(() -> startShutdownActivity(intent));
++        if (mLowBatteryShutdownCommitted) {
++            return;
++        }
++
++        // A zero delay preserves the original immediate low-battery behavior.
++        if (mLowBatteryShutdownDelayMs <= 0) {
++            if (shouldShutdownLocked()) {
++                mLowBatteryShutdownCommitted = true;
++                final long requestId = ++mLowBatteryShutdownRequestId;
++                Intent intent = createShutdownIntent(PowerManager.SHUTDOWN_LOW_BATTERY);
++                mHandler.post(() -> dispatchLowBatteryShutdown(intent, requestId));
++            }
++            return;
+         }
++
++        if (!shouldShutdownLocked() || mPlugType != BATTERY_PLUGGED_NONE) {
++            cancelLowBatteryShutdownLocked();
++            return;
++        }
++        if (mLowBatteryShutdownPending) {
++            return;
++        }
++        if (mAlarmManager == null) {
++            Slog.wtf(TAG, "AlarmManager unavailable for low-battery shutdown");
++            return;
++        }
++
++        final long now = SystemClock.elapsedRealtime();
++        final long deadline = now + mLowBatteryShutdownDelayMs;
++        if (deadline < now) {
++            Slog.wtf(TAG, "Low-battery shutdown deadline overflow");
++            return;
++        }
++
++        final long generation = ++mLowBatteryShutdownGeneration;
++        mLowBatteryShutdownDeadlineElapsedRealtime = deadline;
++        mLowBatteryShutdownPending = true;
++        mLowBatteryShutdownAlarm = () -> handleLowBatteryShutdownAlarm(generation);
++        sendLowBatteryShutdownEventLocked(
++                BatteryManager.LOW_BATTERY_SHUTDOWN_STATE_PENDING);
++        mAlarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, deadline,
++                LOW_BATTERY_SHUTDOWN_ALARM_TAG, mLowBatteryShutdownAlarm, mHandler);
+     }
+ 
++    private void handleLowBatteryShutdownAlarm(long generation) {
++        final Intent intent;
++        synchronized (mLock) {
++            if (mLowBatteryShutdownCommitted || !mLowBatteryShutdownPending
++                    || generation != mLowBatteryShutdownGeneration) {
++                return;
++            }
++            if (mPlugType != BATTERY_PLUGGED_NONE || !shouldShutdownLocked()) {
++                cancelLowBatteryShutdownLocked();
++                return;
++            }
++
++            // This is the linearization point. A later charger update cannot arm another
++            // generation after this callback has committed the shutdown request.
++            mLowBatteryShutdownCommitted = true;
++            mLowBatteryShutdownRequestId = generation;
++            intent = createShutdownIntent(PowerManager.SHUTDOWN_LOW_BATTERY);
++            cancelLowBatteryShutdownLocked();
++        }
++        dispatchLowBatteryShutdown(intent, generation);
++    }
++
++    private void cancelLowBatteryShutdownLocked() {
++        if (!mLowBatteryShutdownPending) {
++            return;
++        }
++        if (mAlarmManager != null && mLowBatteryShutdownAlarm != null) {
++            mAlarmManager.cancel(mLowBatteryShutdownAlarm);
++        }
++        mLowBatteryShutdownAlarm = null;
++        mLowBatteryShutdownPending = false;
++        sendLowBatteryShutdownEventLocked(
++                BatteryManager.LOW_BATTERY_SHUTDOWN_STATE_CANCELED);
++        mLowBatteryShutdownDeadlineElapsedRealtime = 0;
++    }
++
++    private void sendLowBatteryShutdownEventLocked(int state) {
++        final long eventSequence = ++mLowBatteryShutdownEventSequence;
++        if (TextUtils.isEmpty(sSystemUiPackage)) {
++            Slog.w(TAG, "Skipping low-battery shutdown event without SystemUI package");
++            return;
++        }
++
++        final Intent intent = new Intent(BatteryManager.ACTION_LOW_BATTERY_SHUTDOWN_WARNING)
++                .setPackage(sSystemUiPackage)
++                .addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY
++                        | Intent.FLAG_RECEIVER_FOREGROUND
++                        | Intent.FLAG_RECEIVER_REPLACE_PENDING);
++        intent.putExtra(BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_STATE, state);
++        intent.putExtra(BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_DEADLINE,
++                mLowBatteryShutdownDeadlineElapsedRealtime);
++        intent.putExtra(BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_GENERATION,
++                mLowBatteryShutdownGeneration);
++        intent.putExtra(BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_EVENT_SEQUENCE,
++                eventSequence);
++        mHandler.post(() -> ActivityManager.broadcastStickyIntent(intent,
++                AppOpsManager.OP_NONE, LOW_BATTERY_SHUTDOWN_OPTIONS, UserHandle.USER_ALL));
++    }
+ 
+     private void shutdownIfOverTempLocked() {
+         // shut down gracefully if temperature is too high (> 68.0C by default)
+         // wait until the system has booted before attempting to display the
+         // shutdown dialog.
+-        if (mHealthInfo.batteryTemperatureTenthsCelsius > mShutdownBatteryTemperature) {
+-            Intent intent = new Intent(Intent.ACTION_REQUEST_SHUTDOWN);
+-            intent.putExtra(Intent.EXTRA_KEY_CONFIRM, false);
+-            intent.putExtra(Intent.EXTRA_REASON,
+-                    PowerManager.SHUTDOWN_BATTERY_THERMAL_STATE);
+-            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+-            mHandler.post(() -> startShutdownActivity(intent));
++        if (mHealthInfo.batteryTemperatureTenthsCelsius > mShutdownBatteryTemperature
++                && !mThermalShutdownRequested) {
++            mLowBatteryShutdownCommitted = true;
++            mLowBatteryShutdownRequestId = 0;
++            cancelLowBatteryShutdownLocked();
++            mThermalShutdownRequested = true;
++            final long requestId = ++mThermalShutdownRequestId;
++            Intent intent = createShutdownIntent(PowerManager.SHUTDOWN_BATTERY_THERMAL_STATE);
++            mHandler.post(() -> dispatchThermalShutdown(intent, requestId));
+         }
+     }
+ 
+-    private void startShutdownActivity(Intent intent) {
+-        if (!mActivityManagerInternal.isSystemReady()) {
++    private void dispatchLowBatteryShutdown(Intent intent, long requestId) {
++        synchronized (mLock) {
++            if (mLowBatteryShutdownRequestId != requestId) {
++                return;
++            }
++        }
++        if (startShutdownActivity(intent)) {
++            synchronized (mLock) {
++                if (mLowBatteryShutdownRequestId == requestId) {
++                    mLowBatteryShutdownRequestId = 0;
++                }
++            }
+             return;
+         }
++        mHandler.postDelayed(() -> dispatchLowBatteryShutdown(intent, requestId),
++                SHUTDOWN_ACTIVITY_RETRY_DELAY_MS);
++    }
++
++    private void dispatchThermalShutdown(Intent intent, long requestId) {
++        synchronized (mLock) {
++            if (mThermalShutdownRequestId != requestId) {
++                return;
++            }
++        }
++        if (startShutdownActivity(intent)) {
++            synchronized (mLock) {
++                if (mThermalShutdownRequestId == requestId) {
++                    mThermalShutdownRequestId = 0;
++                }
++            }
++            return;
++        }
++        mHandler.postDelayed(() -> dispatchThermalShutdown(intent, requestId),
++                SHUTDOWN_ACTIVITY_RETRY_DELAY_MS);
++    }
++
++    private boolean startShutdownActivity(Intent intent) {
++        if (mActivityManagerInternal == null || !mActivityManagerInternal.isSystemReady()) {
++            return false;
++        }
+ 
+         PackageManagerInternal pmi = LocalServices.getService(PackageManagerInternal.class);
+         if (pmi == null) {
+-            return;
++            return false;
+         }
+ 
+         // Find a target activity for the shutdown request that has android.permission.SHUTDOWN
+         List<ResolveInfo> resolveInfos = pmi.queryIntentActivities(intent, null, 0, Process.myUid(),
+                 mActivityManagerInternal.getCurrentUserId());
++        boolean foundAuthorizedActivity = false;
+         if (resolveInfos != null) {
+             for (int i = 0; i < resolveInfos.size(); i++) {
+                 ResolveInfo ri = resolveInfos.get(i);
+@@ -722,10 +883,20 @@ public final class BatteryService extends SystemService {
+                 }
+ 
+                 intent.setComponent(ri.activityInfo.getComponentName());
++                foundAuthorizedActivity = true;
+                 break;
+             }
+         }
+-        mContext.startActivityAsUser(intent, UserHandle.CURRENT);
++        if (!foundAuthorizedActivity) {
++            return false;
++        }
++        try {
++            mContext.startActivityAsUser(intent, UserHandle.CURRENT);
++        } catch (ActivityNotFoundException | SecurityException e) {
++            Slog.w(TAG, "Unable to start shutdown activity", e);
++            return false;
++        }
++        return true;
+     }
+ 
+     /**
+@@ -822,8 +993,8 @@ public final class BatteryService extends SystemService {
+             // Should never happen.
+         }
+ 
+-        shutdownIfNoPowerLocked();
+         shutdownIfOverTempLocked();
++        shutdownIfNoPowerLocked();
+         mOemFastCharging = isOemFastCharging();
+ 
+         translatedChargingPolicy = translateHalChargingPolicy(mHealthInfo.chargingPolicy);

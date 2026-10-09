@@ -1,0 +1,270 @@
+diff --git a/packages/SystemUI/res/values/strings.xml b/packages/SystemUI/res/values/strings.xml
+index 6ebe3fa97..8a4d191cf 100644
+--- a/packages/SystemUI/res/values/strings.xml
++++ b/packages/SystemUI/res/values/strings.xml
+@@ -3349,6 +3349,12 @@
+     <!-- Shutdown Progress Dialog. This is shown if the user chooses to power off the phone. [CHAR LIMIT=60] -->
+     <string name="shutdown_progress">Shutting down\u2026</string>
+ 
++    <!-- Low battery shutdown grace period dialog and notification. -->
++    <string name="low_battery_shutdown_title">Low battery</string>
++    <string name="low_battery_shutdown_message">Your device will shut down in %1$d seconds. Connect a charger to keep it on.</string>
++    <string name="low_battery_shutdown_notification">Connect a charger before the countdown ends.</string>
++    <string name="low_battery_shutdown_got_it">Got it</string>
++
+     <!-- Text help link for care instructions for overheating devices [CHAR LIMIT=40] -->
+     <string name="thermal_shutdown_dialog_help_text">See care steps</string>
+     <!-- URL for care instructions for overheating devices -->
+diff --git a/packages/SystemUI/src/com/android/systemui/power/PowerNotificationWarnings.java b/packages/SystemUI/src/com/android/systemui/power/PowerNotificationWarnings.java
+index d08710362..20da77922 100644
+--- a/packages/SystemUI/src/com/android/systemui/power/PowerNotificationWarnings.java
++++ b/packages/SystemUI/src/com/android/systemui/power/PowerNotificationWarnings.java
+@@ -36,10 +36,12 @@ import android.content.Intent;
+ import android.content.IntentFilter;
+ import android.media.AudioAttributes;
+ import android.net.Uri;
++import android.os.BatteryManager;
+ import android.os.Bundle;
+ import android.os.Handler;
+ import android.os.Looper;
+ import android.os.PowerManager;
++import android.os.SystemClock;
+ import android.os.UserHandle;
+ import android.provider.Settings;
+ import android.provider.Settings.Global;
+@@ -98,9 +100,12 @@ public class PowerNotificationWarnings implements PowerUI.WarningsUI {
+     private static final boolean DEBUG = PowerUI.DEBUG;
+ 
+     private static final String TAG_BATTERY = "low_battery";
++    private static final String TAG_LOW_BATTERY_SHUTDOWN = "low_battery_shutdown";
+     private static final String TAG_TEMPERATURE = "high_temp";
+     private static final String TAG_AUTO_SAVER = "auto_saver";
+ 
++    private static final long LOW_BATTERY_SHUTDOWN_EVENT_TOLERANCE_MS = 5_000;
++
+     private static final String INTERACTION_JANK_TAG = "start_power_saver";
+ 
+     private static final int SHOWING_NOTHING = 0;
+@@ -156,6 +161,8 @@ public class PowerNotificationWarnings implements PowerUI.WarningsUI {
+     private final KeyguardManager mKeyguard;
+     private final Handler mHandler = new Handler(Looper.getMainLooper());
+     private final Receiver mReceiver = new Receiver();
++    private final LowBatteryShutdownReceiver mLowBatteryShutdownReceiver =
++            new LowBatteryShutdownReceiver();
+     private final Intent mOpenBatterySettings = settings(Intent.ACTION_POWER_USAGE_SUMMARY);
+     private final Intent mOpenBatterySaverSettings =
+             settings(Settings.ACTION_BATTERY_SAVER_SETTINGS);
+@@ -177,6 +184,13 @@ public class PowerNotificationWarnings implements PowerUI.WarningsUI {
+     private SystemUIDialog mHighTempDialog;
+     private SystemUIDialog mThermalShutdownDialog;
+     @VisibleForTesting SystemUIDialog mUsbHighTempDialog;
++    private SystemUIDialog mLowBatteryShutdownDialog;
++    private long mLowBatteryShutdownGeneration;
++    private long mLastCanceledLowBatteryShutdownGeneration;
++    private long mLastLowBatteryShutdownEventSequence;
++    private long mLowBatteryShutdownDeadlineElapsedRealtime;
++    private boolean mLowBatteryShutdownActive;
++    private boolean mLowBatteryShutdownNotificationShown;
+     private BatteryStateSnapshot mCurrentBatterySnapshot;
+     private ActivityStarter mActivityStarter;
+     private final BroadcastSender mBroadcastSender;
+@@ -202,7 +216,6 @@ public class PowerNotificationWarnings implements PowerUI.WarningsUI {
+         mNoMan = mContext.getSystemService(NotificationManager.class);
+         mPowerMan = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+         mKeyguard = mContext.getSystemService(KeyguardManager.class);
+-        mReceiver.init();
+         mActivityStarter = activityStarter;
+         mBroadcastSender = broadcastSender;
+         mBatteryControllerLazy = batteryControllerLazy;
+@@ -211,6 +224,8 @@ public class PowerNotificationWarnings implements PowerUI.WarningsUI {
+         mUserTracker = userTracker;
+         mUseExtraSaverConfirmation =
+                 mContext.getResources().getBoolean(R.bool.config_extra_battery_saver_confirmation);
++        mLowBatteryShutdownReceiver.init();
++        mReceiver.init();
+     }
+ 
+     @Override
+@@ -485,6 +500,156 @@ public class PowerNotificationWarnings implements PowerUI.WarningsUI {
+         mNoMan.cancelAsUser(TAG_TEMPERATURE, SystemMessage.NOTE_THERMAL_SHUTDOWN, UserHandle.ALL);
+     }
+ 
++    private boolean isValidLowBatteryShutdownDeadline(long deadline, long now) {
++        if (deadline <= now) {
++            return false;
++        }
++        final long remaining = deadline - now;
++        final long configuredDelay = Math.max(1L, mContext.getResources().getInteger(
++                com.android.internal.R.integer.config_lowBatteryShutdownDelayMs));
++        return remaining <= configuredDelay + LOW_BATTERY_SHUTDOWN_EVENT_TOLERANCE_MS;
++    }
++
++    private void handleLowBatteryShutdownEvent(Intent intent) {
++        final int state = intent.getIntExtra(
++                BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_STATE, 0);
++        final long generation = intent.getLongExtra(
++                BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_GENERATION, -1);
++        final long eventSequence = intent.getLongExtra(
++                BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_EVENT_SEQUENCE, -1);
++        if ((state != BatteryManager.LOW_BATTERY_SHUTDOWN_STATE_PENDING
++                && state != BatteryManager.LOW_BATTERY_SHUTDOWN_STATE_CANCELED)
++                || generation <= 0 || eventSequence <= 0
++                || eventSequence <= mLastLowBatteryShutdownEventSequence) {
++            return;
++        }
++
++        if (state == BatteryManager.LOW_BATTERY_SHUTDOWN_STATE_PENDING) {
++            final long deadline = intent.getLongExtra(
++                    BatteryManager.EXTRA_LOW_BATTERY_SHUTDOWN_DEADLINE, -1);
++            if (!isValidLowBatteryShutdownDeadline(deadline, SystemClock.elapsedRealtime())) {
++                mLastLowBatteryShutdownEventSequence = eventSequence;
++                if (generation >= mLowBatteryShutdownGeneration) {
++                    clearLowBatteryShutdownUi(generation);
++                }
++                return;
++            }
++            if (generation <= mLastCanceledLowBatteryShutdownGeneration
++                    || (mLowBatteryShutdownActive
++                    && generation < mLowBatteryShutdownGeneration)) {
++                mLastLowBatteryShutdownEventSequence = eventSequence;
++                return;
++            }
++            if (mLowBatteryShutdownActive && generation == mLowBatteryShutdownGeneration) {
++                mLastLowBatteryShutdownEventSequence = eventSequence;
++                return;
++            }
++
++            mLastLowBatteryShutdownEventSequence = eventSequence;
++            if (mLowBatteryShutdownActive) {
++                clearLowBatteryShutdownUi(mLowBatteryShutdownGeneration);
++            }
++            mLowBatteryShutdownGeneration = generation;
++            mLowBatteryShutdownDeadlineElapsedRealtime = deadline;
++            mLowBatteryShutdownActive = true;
++            mLowBatteryShutdownNotificationShown = false;
++            showLowBatteryShutdownDialog();
++            return;
++        }
++
++        if (mLowBatteryShutdownActive && generation < mLowBatteryShutdownGeneration) {
++            mLastLowBatteryShutdownEventSequence = eventSequence;
++            return;
++        }
++        mLastLowBatteryShutdownEventSequence = eventSequence;
++        clearLowBatteryShutdownUi(generation);
++    }
++
++    private boolean isCurrentLowBatteryShutdownDialog(SystemUIDialog dialog, long generation) {
++        return mLowBatteryShutdownActive
++                && mLowBatteryShutdownGeneration == generation
++                && mLowBatteryShutdownDialog == dialog;
++    }
++
++    private void showLowBatteryShutdownDialog() {
++        final long generation = mLowBatteryShutdownGeneration;
++        final long remaining = mLowBatteryShutdownDeadlineElapsedRealtime
++                - SystemClock.elapsedRealtime();
++        final int remainingSeconds = (int) Math.max(1L, (remaining + 999L) / 1000L);
++        final SystemUIDialog d = mSystemUIDialogFactory.create();
++        d.setIconAttribute(android.R.attr.alertDialogIcon);
++        d.setTitle(R.string.low_battery_shutdown_title);
++        d.setMessage(mContext.getString(R.string.low_battery_shutdown_message,
++                remainingSeconds));
++        d.setPositiveButton(R.string.low_battery_shutdown_got_it,
++                (dialog, which) -> {
++                    if (isCurrentLowBatteryShutdownDialog(d, generation)) {
++                        showLowBatteryShutdownNotification();
++                    }
++                });
++        d.setShowForAllUsers(true);
++        d.setCancelable(false);
++        d.setOnDismissListener(dialog -> {
++            if (isCurrentLowBatteryShutdownDialog(d, generation)) {
++                mLowBatteryShutdownDialog = null;
++                showLowBatteryShutdownNotification();
++            }
++        });
++        d.getWindow().addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
++                | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
++        mLowBatteryShutdownDialog = d;
++        d.show();
++    }
++
++    private void showLowBatteryShutdownNotification() {
++        if (!mLowBatteryShutdownActive || mLowBatteryShutdownNotificationShown) {
++            return;
++        }
++        final long now = SystemClock.elapsedRealtime();
++        if (!isValidLowBatteryShutdownDeadline(
++                mLowBatteryShutdownDeadlineElapsedRealtime, now)) {
++            clearLowBatteryShutdownUi(mLowBatteryShutdownGeneration);
++            return;
++        }
++        final long remaining = mLowBatteryShutdownDeadlineElapsedRealtime - now;
++        final String contentText = mContext.getString(R.string.low_battery_shutdown_notification);
++        final Notification.Builder nb = new Notification.Builder(
++                mContext, NotificationChannels.BATTERY)
++                .setSmallIcon(R.drawable.ic_power_low)
++                .setWhen(System.currentTimeMillis() + remaining)
++                .setShowWhen(true)
++                .setOngoing(true)
++                .setOnlyAlertOnce(true)
++                .setContentTitle(mContext.getString(R.string.low_battery_shutdown_title))
++                .setContentText(contentText)
++                .setVisibility(Notification.VISIBILITY_PUBLIC)
++                .setUsesChronometer(true)
++                .setChronometerCountDown(true)
++                .setColor(Utils.getColorAttrDefaultColor(mContext,
++                        android.R.attr.colorError));
++        NotificationUtils.overrideNotificationAppName(mContext, nb, false);
++        mNoMan.notifyAsUser(TAG_LOW_BATTERY_SHUTDOWN, SystemMessage.NOTE_POWER_LOW,
++                nb.build(), UserHandle.ALL);
++        mLowBatteryShutdownNotificationShown = true;
++    }
++
++    private void clearLowBatteryShutdownUi(long canceledGeneration) {
++        mLowBatteryShutdownActive = false;
++        mLastCanceledLowBatteryShutdownGeneration = Math.max(
++                mLastCanceledLowBatteryShutdownGeneration, canceledGeneration);
++        mLowBatteryShutdownGeneration = Math.max(mLowBatteryShutdownGeneration,
++                canceledGeneration);
++        mLowBatteryShutdownDeadlineElapsedRealtime = 0;
++        mLowBatteryShutdownNotificationShown = false;
++        final SystemUIDialog dialog = mLowBatteryShutdownDialog;
++        mLowBatteryShutdownDialog = null;
++        if (dialog != null) {
++            dialog.dismiss();
++        }
++        mNoMan.cancelAsUser(TAG_LOW_BATTERY_SHUTDOWN, SystemMessage.NOTE_POWER_LOW,
++                UserHandle.ALL);
++    }
++
+     private void showThermalShutdownDialog() {
+         if (mThermalShutdownDialog != null) return;
+         final SystemUIDialog d = mSystemUIDialogFactory.create();
+@@ -821,6 +986,25 @@ public class PowerNotificationWarnings implements PowerUI.WarningsUI {
+         }
+     }
+ 
++    private final class LowBatteryShutdownReceiver extends BroadcastReceiver {
++
++        public void init() {
++            IntentFilter filter = new IntentFilter(
++                    BatteryManager.ACTION_LOW_BATTERY_SHUTDOWN_WARNING);
++            Intent stickyIntent = mContext.registerReceiverAsUser(this, UserHandle.ALL, filter,
++                    android.Manifest.permission.DEVICE_POWER, mHandler,
++                    Context.RECEIVER_NOT_EXPORTED);
++            if (stickyIntent != null) {
++                mHandler.post(() -> handleLowBatteryShutdownEvent(stickyIntent));
++            }
++        }
++
++        @Override
++        public void onReceive(Context context, Intent intent) {
++            handleLowBatteryShutdownEvent(intent);
++        }
++    }
++
+     private final class Receiver extends BroadcastReceiver {
+ 
+         public void init() {
