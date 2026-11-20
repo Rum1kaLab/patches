@@ -1,0 +1,45 @@
+diff --git a/techpack/audio/Makefile b/techpack/audio/Makefile
+--- a/techpack/audio/Makefile
++++ b/techpack/audio/Makefile
+@@ -12,8 +12,14 @@
+ export $(shell sed 's/=.*//' $(srctree)/techpack/audio/config/sdxpoorwillsauto.conf)
+ endif
+ ifeq ($(CONFIG_ARCH_SM8150), y)
+-include $(srctree)/techpack/audio/config/sm8150auto.conf
+-export $(shell sed 's/=.*//' $(srctree)/techpack/audio/config/sm8150auto.conf)
++sm8150_audio_config := $(srctree)/techpack/audio/config/sm8150auto.conf
++include $(sm8150_audio_config)
++ifeq ($(CONFIG_BOARD_FLORAL),y)
++# Link the audio drivers selected as modules in the SM8150 profile into vmlinux.
++floral_audio_drivers := $(shell sed -n 's/=m$$//p' $(sm8150_audio_config))
++$(foreach driver,$(floral_audio_drivers),$(eval $(driver) := y))
++endif
++export $(shell sed 's/=.*//' $(sm8150_audio_config))
+ endif
+ ifeq ($(CONFIG_ARCH_SDMSHRIKE), y)
+ include $(srctree)/techpack/audio/config/sm8150auto.conf
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -13460,10 +13460,21 @@
+ 		goto error_return;
+ 	}
+ 
++	/* Set the initial state before userspace can trigger another load. */
++	if (IS_ENABLED(CONFIG_BOARD_FLORAL)) {
++		ret = hdd_driver_load();
++		if (ret)
++			hdd_fln("WLAN auto-start failed (%d); boot_wlan can retry", ret);
++		else
++			wlan_loader->loaded_state = MODULE_INITIALIZED;
++	}
++
+ 	ret = sysfs_create_group(wlan_loader->boot_wlan_obj,
+ 				 wlan_loader->attr_group);
+ 	if (ret) {
+ 		hdd_fln("sysfs create group failed; errno:%d", ret);
++		if (wlan_loader->loaded_state)
++			hdd_driver_unload();
+ 		goto error_return;
+ 	}
+ 
