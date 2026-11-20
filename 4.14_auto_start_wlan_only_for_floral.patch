@@ -1,0 +1,25 @@
+diff --git a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+--- a/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
++++ b/drivers/staging/qcacld-3.0/core/hdd/src/wlan_hdd_main.c
+@@ -13460,10 +13460,21 @@
+ 		goto error_return;
+ 	}
+ 
++	/* Set the initial state before userspace can trigger another load. */
++	if (IS_ENABLED(CONFIG_BOARD_FLORAL)) {
++		ret = hdd_driver_load();
++		if (ret)
++			hdd_fln("WLAN auto-start failed (%d); boot_wlan can retry", ret);
++		else
++			wlan_loader->loaded_state = MODULE_INITIALIZED;
++	}
++
+ 	ret = sysfs_create_group(wlan_loader->boot_wlan_obj,
+ 				 wlan_loader->attr_group);
+ 	if (ret) {
+ 		hdd_fln("sysfs create group failed; errno:%d", ret);
++		if (wlan_loader->loaded_state)
++			hdd_driver_unload();
+ 		goto error_return;
+ 	}
+ 
